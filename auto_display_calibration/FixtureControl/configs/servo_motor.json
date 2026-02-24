@@ -1,0 +1,24 @@
+{
+    "X": {
+        "axis_no": 1,
+        "driver_vendor": "禾川电机",
+        "ratio": 1,
+        "lead": 20,
+        "c_count": 10000,
+        "speed": 1000,
+        "acceleration": 300,
+        "position": 3,
+        "disable_home": true
+    },
+    "Y": {
+        "axis_no": 2,
+        "driver_vendor": "禾川电机",
+        "ratio": 1,
+        "lead": 20,
+        "c_count": 10000,
+        "speed": 100,
+        "acceleration": 1,
+        "position": 5,
+        "disable_home": true
+    }
+}

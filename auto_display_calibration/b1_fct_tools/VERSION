@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# Version number for B1 FCT tools
+
+VERSION=0.1.0

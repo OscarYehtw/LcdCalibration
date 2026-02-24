@@ -1,0 +1,14 @@
+config:
+  FATP-DISP-ARTIFACT-STERD:
+    config_path: /home/innorev/.innorev/config/displayArtifact_STRED_config.yaml
+  FATP-DISP-ARTIFACT:
+    config_path: ./FixtureControl/displayArtifact_config.yaml
+  FATP-DISP-CAL:
+    config_path: ./FixtureControl/displayCal_config.yaml
+  FATP-DISP-OA:
+    config_path: /home/innorev/FixtureControl/displayP7OA_config.yaml
+  FATP-DISP-TurnTable:
+    config_path: ./FixtureControl/displayTurnTable_config.yaml
+  log_path: ./Test_log
+
+

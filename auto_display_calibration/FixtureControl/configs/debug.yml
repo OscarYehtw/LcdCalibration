@@ -1,0 +1,4 @@
+APP:
+  project: "Interface.Display_Interface.Display_Interface"
+  interfacewindow: "InnorevFramework.Forms.InterfaceForm.InterfaceForm"
+  extendwindow: 

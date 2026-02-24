@@ -5,6 +5,7 @@ import pandas as pd
 import os
 import platform
 import subprocess
+import logging
 from numpy.linalg import inv
 from datetime import datetime
 import seaborn as sns
@@ -14,6 +15,11 @@ from colour.plotting import plot_chromaticity_diagram_CIE1976UCS
 from colour.plotting import plot_chromaticity_diagram_CIE1931
 from cli.cli import detect_com_ports, enable_lcd, _uart
 import Utils.B1_primary_cal_3x3 as primary_cal
+from ColorCalFramework.measurement import *
+from FixtureControl.DisplayInterface import DisplayInterface
+import dspcal_lib as lib
+from b1_fct_tools.FCT import *
+import logging
 
 # =========================
 # SKU-specific defaults
@@ -35,6 +41,41 @@ DEFAULT_MEASUREMENTS = {
 }
 
 dottlined_labels = ['target', 'spec', 'ref']
+
+station = lib.station
+station_mode = station.config.station_mode
+
+class TestData:
+    def __init__(self, logger=None):
+        self.state = {}              # dictionary for port, fixture_number, Hyperion
+        self.measurements = {}
+        self.phase_results = []
+        self.async_dut_index = '0-0' # default to first fixture
+        self.logger = logger or logging.getLogger("LCD_CAL") # optional, used in some places
+
+    def AddPhaseResult(self, phase_name, outcome, detail=None):
+        self.phase_results.append({
+            "phase": phase_name,
+            "outcome": outcome,
+            "detail": detail
+        })
+
+    def GetPhaseResult(self):
+        return self.phase_results
+
+def setup_logger():
+    logger = logging.getLogger("LCD_CAL")
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        fmt = logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        )
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    return logger
 
 def read_master_csv(path):
     """
@@ -282,6 +323,18 @@ def uv_to_xy(u, v):
     if denom == 0: return np.array([0.0, 0.0])
     return np.array([9*u / denom, 4*v / denom])
 
+def run_if_cal_is_pass(test_data):
+    print(f"station_mode: {station_mode}")
+    if station_mode != 'RELIABILITY':
+      phase_results = test_data.GetPhaseResult()
+      if phase_results[1]['outcome'] == 'PASS' or phase_results[1]['outcome'] == 'SCOF_PASS':
+        return True
+      else:
+        return False
+    else:
+      return True
+
+
 class DisplayCalibrator:
     """
     Standard 3x3 Display Calibration Procedure with White Point Adaptation.
@@ -367,6 +420,92 @@ class DisplayCalibrator:
             'target_white': target_w_xy
         }
 
+    def save_calibration_data(self, test_data):
+        master_p = DEFAULT_MASTER_P
+        master_w = DEFAULT_MASTER_W
+        measurements = DEFAULT_MEASUREMENTS
+               
+        master_p, master_w = read_master_csv(self.master_path)
+        #measurements = read_measured_csv(self.measured_path)
+        result = self.compute_matrix(measurements, master_p, master_w)
+
+        # Assign usb port & Hyperion to current fixture
+        #test_data.async_dut_index = '1-0'
+        test_data.state['port'] = mapping_usb_port[test_data.async_dut_index]
+        test_data.state['Hyperion'] = mapping_hyperion[test_data.async_dut_index]
+        test_data.state['fixture_number'] = mapping_fixture_number[test_data.async_dut_index]
+
+        disp_cal_md = result['Md']
+        disp_cal_ms = result['Ms']
+        disp_cal_mf = result['Mf']
+        rgb_max = result['RGB_max']
+
+        cmd_format = '{:.5f},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f}'
+        mat = disp_cal_md
+        disp_cal_md_str = cmd_format.format(mat[0, 0], mat[0, 1], mat[0, 2],
+                                            mat[1, 0], mat[1, 1], mat[1, 2],
+                                            mat[2, 0], mat[2, 1], mat[2, 2])
+        mat = disp_cal_ms
+        disp_cal_ms_str = cmd_format.format(mat[0, 0], mat[0, 1], mat[0, 2],
+                                            mat[1, 0], mat[1, 1], mat[1, 2],
+                                            mat[2, 0], mat[2, 1], mat[2, 2])
+        mat = disp_cal_mf
+        disp_cal_mf_str = cmd_format.format(mat[0, 0], mat[0, 1], mat[0, 2],
+                                            mat[1, 0], mat[1, 1], mat[1, 2],
+                                            mat[2, 0], mat[2, 1], mat[2, 2])
+        rgb_max_str = '{:.5f}'.format(rgb_max)
+               
+        # write matrices to sysenv
+        flag = 1
+        # ----- disp_cal_md
+        if b1_fct[test_data.state['fixture_number']].set_sysenv_retries(test_data, 'disp_cal_md', disp_cal_md_str):
+          print('write the disp_cal_md succeed!')
+          test_data.logger.info('write the disp_cal_md succeed!')
+        else:
+          flag = 0
+          print('[ERROR] write the disp_cal_md failed!')
+          test_data.logger.error('[ERROR] write the disp_cal_md failed!')
+        # ----- disp_cal_ms
+        if b1_fct[test_data.state['fixture_number']].set_sysenv_retries(test_data, 'disp_cal_ms', disp_cal_ms_str):
+          print('write the disp_cal_ms succeed!')
+          test_data.logger.info('write the disp_cal_ms succeed!')
+        else:
+          flag = 0
+          print('[ERROR] write the disp_cal_ms failed!')
+          test_data.logger.error('[ERROR] write the disp_cal_ms failed!')
+        # ----- disp_cal_mf
+        if b1_fct[test_data.state['fixture_number']].set_sysenv_retries(test_data, 'disp_cal_mf', disp_cal_mf_str):
+          print('write the disp_cal_mf succeed!')
+          test_data.logger.info('write the disp_cal_mf succeed!')
+        else:
+          flag = 0
+          print('[ERROR] write the disp_cal_mf failed!')
+          test_data.logger.error('[ERROR] write the disp_cal_mf failed!')
+        # ----- disp_cal_rgb_max
+        if b1_fct[test_data.state['fixture_number']].set_sysenv_retries(test_data, 'disp_cal_rgb_max', rgb_max_str):
+          print('write the disp_cal_rgb_max succeed!')
+          test_data.logger.info('write the disp_cal_rgb_max succeed!')
+        else:
+          flag = 0
+          print('[ERROR] write the disp_cal_rgb_max failed!')
+          test_data.logger.error('[ERROR] write the disp_cal_rgb_max failed!')
+        #
+        test_data.state['disp_cal_md'] = disp_cal_md
+        test_data.state['disp_cal_ms'] = disp_cal_ms
+        test_data.state['disp_cal_mf'] = disp_cal_mf
+        test_data.state['disp_cal_rgb_max'] = rgb_max
+        test_data.measurements['disp_cal_md'] = disp_cal_md_str
+        test_data.measurements['disp_cal_ms'] = disp_cal_ms_str
+        test_data.measurements['disp_cal_mf'] = disp_cal_mf_str
+        test_data.measurements['disp_cal_rgb_max'] = rgb_max_str
+        test_data.measurements['calibration_data'] = flag
+
+        # for cal file check
+        test_data.state['disp_cal_md_str'] = disp_cal_md_str
+        test_data.state['disp_cal_ms_str'] = disp_cal_ms_str
+        test_data.state['disp_cal_mf_str'] = disp_cal_mf_str
+        test_data.state['disp_cal_rgb_max_str'] = rgb_max_str
+
     def run_apply_wrbg(self, mode="pre", panel_id="gold"):
         file_exists = os.path.exists(self.measured_path)
         with open(self.measured_path, "a", newline="", encoding="utf-8") as f:
@@ -386,10 +525,8 @@ class DisplayCalibrator:
                measurements = DEFAULT_MEASUREMENTS
                
                master_p, master_w = read_master_csv(self.master_path)
-               measurements = read_measured_csv(self.measured_path)
-               
+               #measurements = read_measured_csv(self.measured_path)
                result = self.compute_matrix(measurements, master_p, master_w)
-
                if 0:
                   # Output
                   print("master_p, master_w:\n", master_p, master_w)
@@ -436,7 +573,7 @@ class DisplayCalibrator:
                 if system == "Windows":
                     _uart.port = "COM3"
                 elif system == "Linux":
-                    _uart.port = "/dev/ttyUSB0"
+                    _uart.port = "/dev/ttyACM0"
                 else:
                     print(f"[WARNING] Unsupported platform: {system}")
                     continue
@@ -488,10 +625,41 @@ class DisplayCalibrator:
          if os.path.exists(self.cs160_path):
              os.remove(self.cs160_path)
 
+        if mode == "pre":
+          test_data.AddPhaseResult("PRE", "PASS")
+        else:
+          test_data.AddPhaseResult("POST", "SCOF_PASS")
+
+        if mode == "post":
+          if run_if_cal_is_pass(test_data):
+            self.save_calibration_data(test_data)
+
         #print("[DONE] All colors completed")
 
-
 if __name__ == "__main__":
+
+    # Declare user defined configs
+    # Initialize test_data
+    test_data = TestData(setup_logger())
+
+    # only for offline validation
+    disabled_fixture_ctrl = False
+    disabled_device_ctrl = False
+
+    # Read mapping table by csv
+    mapping_usb_port, mapping_hyperion, mapping_fixture_number = lib.read_mapping_table_by_csv(station_id='B1_BN3-BF1_FATP-DISP-CAL_IN23A-03')
+    print('****** mapping_usb_port: {}'.format(mapping_usb_port))
+    print('****** mapping_hyperion: {}'.format(mapping_hyperion))
+    print('****** mapping_fixture_number: {}'.format(mapping_fixture_number))
+
+    # Objects Instantiate
+    print('[FixtureControl] fixture control {}.'.format('enabled' if not disabled_fixture_ctrl else 'disabled'))
+    #if not disabled_fixture_ctrl:
+    #  fixture_ctrl = DisplayInterface('FATP-DISP-CAL')
+
+    b1_fct0 = FCT_CTRL(demo=disabled_device_ctrl)
+    b1_fct1 = FCT_CTRL(demo=disabled_device_ctrl)
+    b1_fct = [b1_fct0, b1_fct1]
 
     parser = argparse.ArgumentParser(
         description="Generate 3x3 Color Correction Matrix (CCM)"
@@ -580,6 +748,7 @@ if __name__ == "__main__":
 
     # Run calibration
     cal = DisplayCalibrator(max_delta_uv=args.max_delta_uv)
+
     cal.run_apply_wrbg("pre", panel_id=args.id)
     cal.run_apply_wrbg("post", panel_id=args.id)
 

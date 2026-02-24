@@ -1,0 +1,20 @@
+boardIO1:
+  input:
+    E_Stop: 1
+    START_STATUS: 2
+    RESET_STATUS: 4
+    STOP_STATUS: 3
+    DOOR_STATUS: 5
+    HOLD_STATUS: 6
+    TYPEC_ORIGIN: 7
+    TYPEC_TEST: 8
+  output:
+    START_LIGHT: 1
+    RESET_LIGHT: 2
+    STOP_LIGHT: 3
+    TWO_COLOR_GREEN: 4
+    TWO_COLOR_RED: 5
+    TYPEC: 6
+light_config:
+  channel: 1
+  value: 20

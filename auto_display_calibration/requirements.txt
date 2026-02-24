@@ -1,0 +1,8 @@
+pandas>=1.0
+numpy>=1.18
+matplotlib>=3.1
+mpld3>=0.5.9
+colour-science>=0.3.16
+openpyxl>=3.1.0
+tk
+pyserial

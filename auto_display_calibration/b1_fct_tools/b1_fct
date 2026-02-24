@@ -1,0 +1,869 @@
+#!/bin/bash
+
+DIR="$(dirname $0)"
+
+source "${DIR}/VERSION"
+
+export PATH="${DIR}:${PATH}"
+
+readonly PORT_PATH_USB="/dev/ttyACM"
+
+# -echo    : Disable "echo input characters"
+# -icrnl   : Disable "translate carriage return to newline"
+# -ixon    : Disable "enable XON/XOFF flow control"
+# -isig    : Disable "enable interrupt, quit, and suspend special characters"
+# -icanon  : Disable "enable special characters: erase, kill, werase, rprnt"
+# -iexten  : Disable "enable non-POSIX special characters"
+#  ignbrk  : Enable  "ignore break characters"
+#  ignpar  : Enable  "ignore characters with parity errors"
+# -opost   : Disable "postprocess output"
+readonly PORT_ATTR="-echo -icrnl -ixon -isig -icanon -iexten ignbrk ignpar -opost min 1"
+readonly CMD_GET_SERIAL="sysenv get serial#"
+readonly CMD_NTC_MCU="fct-sys temp ntc_mcu"
+readonly CMD_NTC_WIFI="fct-sys temp ntc_wifi"
+readonly CMD_READ_TEMP="fct-rht read t"
+readonly CMD_READ_RH="fct-rht read rh"
+
+# Error mesages
+readonly CMD_ERROR_NO_SERIAL="Serial# (empty)"
+readonly CMD_ERROR_NO_RESPONSE="No Device"
+readonly CMD_ERROR_TIMEOUT="ERROR: TIMEOUT"
+readonly CMD_ERROR_GEN="ERROR"
+
+# Device Response
+readonly DEV_RESP_ACK_DONE="ACK_DONE"
+readonly DEV_RESP_DONE="DONE 0"
+readonly DEV_RESP_START="ACK: "
+readonly DEV_RESP_RESET_REASON="reset reason:"
+readonly DEV_RESP_PANIC_START="Oops!"
+readonly DEV_RESP_WDOG_START="!!wdog!!"
+readonly DEV_RESP_BOOTLOADER_START="Bootloader"
+readonly DEV_RESP_OSM_UPDATE_SUCCESS="Osm update success"
+readonly DEV_RESP_AUPD_MODE="Welcome to Zirconium AUPD"
+readonly DEV_RESP_NOT_FOUND="Error: No such command: "
+readonly DEV_RESP_SYSENV_GET_ERROR="result = -22"
+
+# Baudrate
+readonly BAUDRATE_DEFAULT=1000000
+readonly BAUDRATE_RUNIN_LOG=3000000
+readonly BAUDRATE_FCT_RADAR_FRAME=115200
+readonly BAUDRATE_SUPPORTED="115200 1000000 2000000 3000000"
+
+# For Development
+DEBUG_MODE=""
+SHOW_TIME_DUR=0
+#
+# Send only 4 keys to port in a row to avoid HW FIFO overflow when critical section was taken
+# This issue was fixed by UART driver updates using RX DMA
+# However issue can be reproduced on multiple trial
+SEND_KEY_SAFE_MODE=0
+
+# Script Mode
+SKIP_CLEAN_PORT=0
+SEND_CMD_ONLY=0
+
+# Target information
+TARGET_PORT=""
+TARGET_SERIAL=""
+TARGET_PORT_LIST=""
+TARGET_BAUD_RATE="$BAUDRATE_DEFAULT"
+
+# Timeout in seconds
+TIMEOUT=3600
+TIMEOUT_GET_SERIAL="0.1"
+
+# CMD & Checking response
+FCT_CMD=""
+DEV_RESP=""
+EXIT_STRING=""
+EXIT_REGEX=""
+
+# For Temperature sensor testing
+declare -a FCT_PORT_LIST
+declare -a FCT_PORT_SERIAL_LIST
+declare -a FCT_PORT_PID_LIST
+
+TEMP_LOG_INTERVAL=3
+TEMP_LOG_DURATION=60
+
+###############################
+# Commnad interface
+###############################
+function send_cmd {
+  local fd="${1:-}"
+  local cmd="${2:-}"
+
+  if [ "$SEND_KEY_SAFE_MODE" -eq 0 ]; then
+    echo -en "$cmd\r" >&"$fd"
+  else
+    send_cmd_safe "$fd" "$cmd"
+  fi
+}
+
+function send_cmd_safe {
+  local fd="${1:-}"
+  local cmd="${2:-}"
+  local splited keys
+  local IFS=':'
+
+  debug_msg "Send only 4 Keys in a row"
+
+  # Splite input string to 4 chars word each
+  splited="$(echo "$cmd" | sed -r 's/(.{4})/\1:/g')"
+
+  for keys in $splited; do
+    echo -en "$keys" >&"$fd"
+    sleep 0.1
+  done
+  echo -en "\r" >&"$fd"
+}
+
+function send_cmd_baudrate {
+  local port="${1:-}"
+  local baudrate="${2:-}"
+
+  open_file fd "$port"
+
+  # Send baudrate changing command to device
+  send_cmd "$fd" "baudrate ${baudrate}"
+
+  # Update port baudrate on host pc
+  set_port_attr "$port" "$baudrate"
+
+  # After changing device side UART baudrate,
+  # Can't get device response.
+  # Wait for 100ms and flush the data
+  timeout 0.1 cat <&"$fd" > /dev/null
+
+  close_file fd
+}
+
+function show_resp {
+  local port_name="${1:-}"
+  local resp="${2:-}"
+  local cont_display="${3:-0}"
+
+  echo -en "${resp}\r\n" >> "$(pwd)/fct_last_cmd_${port_name}.log"
+
+  if [ "$cont_display" -eq 0 ]; then
+    DEV_RESP="${DEV_RESP}${resp}\r\n"
+  else
+    echo -en "${resp}\r\n"
+  fi
+}
+
+function get_resp {
+  local fd="${1:-}"
+  local port_name="$(basename ${TARGET_PORT})"
+  local timeout="${2:-$TIMEOUT}"
+  local cont_display="${3:-0}"
+  local logging_start="${4:-0}"
+  local exit_string="${5:-$EXIT_STRING}"
+  local exit_regex="${6:-$EXIT_REGEX}"
+  local panic_file=""
+  local is_aupd=0
+
+  # 0 : Waiting
+  # 1 : Recording response
+  # 2 : Done
+  # 3 : Panic or WDog Start & recording
+  local record_state="$logging_start"
+
+  DEV_RESP=""
+  rm -f "$(pwd)/fct_last_cmd_${port_name}.log"
+
+  # Set IFS(Internal Field Separator) to separate command response
+  # Allow TAB
+  local IFS=$'\r'$'\n'
+
+  while read -t "$timeout" -u "$fd" resp; do
+    ###############################
+    # STOP Conditions
+    ###############################
+    if [ "$resp" = "$DEV_RESP_ACK_DONE" ]; then
+      # Stop recording: ACK_DONE
+      record_state=2
+      debug_msg "$resp"
+      break
+    elif [[ "$resp" =~ "$DEV_RESP_DONE" ]]; then
+      # Stop recording: DONE
+      record_state=2
+      debug_msg "$resp"
+      break
+    elif [ "$record_state" -eq 1 ] && [ ! -z "$exit_string" ] && [[ "$resp" =~ "$exit_string" ]]; then
+      # Stop recording: Found exit_string
+      record_state=2
+      show_resp "$port_name" "$resp" "$cont_display"
+      break
+    elif [ "$record_state" -eq 1 ] && [ ! -z "$exit_regex" ] && [[ "$resp" =~ $exit_regex ]]; then
+      # Stop recording: Found exit_regex
+      record_state=2
+      show_resp "$port_name" "$resp" "$cont_display"
+      break
+    ###############################
+    # OSM Install(AUPD) Conditions
+    ###############################
+    elif [ "$record_state" -eq 1 ] && [[ "$resp" =~ "$DEV_RESP_AUPD_MODE" ]]; then
+      # Keep recording. SW Updating is on going.
+      is_aupd=1
+      show_resp "$port_name" "$resp" "$cont_display"
+    elif [ "$record_state" -eq 1 ] && [[ "$resp" =~ "$DEV_RESP_OSM_UPDATE_SUCCESS" ]]; then
+      # Keep recording. SW Updating is Done.
+      is_aupd=0
+      show_resp "$port_name" "$resp" "$cont_display"
+    elif [ "$record_state" -eq 1 ] && [ -z "$exit_string" ] && [ -z "$exit_regex" ] && [[ "$resp" =~ "$DEV_RESP_RESET_REASON" ]] && [[ "$is_aupd" -eq 0 ]]; then
+      # Bootup Done
+      record_state=2
+      show_resp "$port_name" "$resp" "$cont_display"
+      break
+    ###############################
+    # Recording or Start Recording
+    ###############################
+    elif [ "$record_state" -eq 1 ]; then
+      # Recording Device response
+      show_resp "$port_name" "$resp" "$cont_display"
+    elif [ "$record_state" = 0 ] && [[ "$resp" =~ "$DEV_RESP_START" ]]; then
+      # Start recording: ACK
+      record_state=1
+      show_resp "$port_name" "$resp" "$cont_display"
+    ###############################
+    # Error
+    ###############################
+    elif [[ "$resp" =~ "$DEV_RESP_NOT_FOUND" ]]; then
+      # Start recording: Invalid Command
+      record_state=1
+      show_resp "$port_name" "$resp" "$cont_display"
+    elif [ "$record_state" = 0 ]; then
+      # Display lines received before getting the ACK as debug messages
+      debug_msg "$resp"
+    fi
+  done
+
+  if [ "$record_state" -ne 2 ]; then
+    show_resp "$port_name" "$CMD_ERROR_TIMEOUT" "$cont_display"
+  fi
+}
+
+function exec_cmd {
+  local shell_cmd="${1:-}"
+  local fct_port="${2:-$TARGET_PORT}"
+  local timeout="${3:-$TIMEOUT}"
+  local cont_display="${4:-0}"
+
+  # Check Port
+  if [ ! -c "$fct_port" ]; then
+    echo "ERROR: \"${fct_port}\" doesn't exist"
+    exit 1
+  fi
+
+  if [ -z "$shell_cmd" ]; then
+    echo "ERROR: Required device command to be specified."
+    exit 1
+  fi
+
+  set_port_attr "$fct_port"
+
+  # Open file for $fct_port
+  open_file fd "$fct_port"
+
+  # Things are done just a little bit backwards. We start to try and receive the
+  # response before sending the command, in order to ensure that no data is
+  # dropped between the two.
+  if [ "$SEND_CMD_ONLY" -eq 1 ]; then
+    debug_msg "Send Command Only"
+  else
+    debug_msg "Response Timeout: ${timeout}s"
+    get_resp "$fd" "$timeout" "$cont_display" &
+    sleep 0.005
+  fi
+
+  debug_msg "Sending Shell CMD: \"${shell_cmd}\""
+  send_cmd "$fd" "$shell_cmd"
+
+  # If we backgrounded the get_resp, then wait for completion
+  wait $(jobs -p)
+
+  # Close file
+  close_file fd
+}
+
+function exec_shell_cmd {
+  exec_cmd "$1" "$2" "$3" 1
+}
+
+###############################
+# Port handling
+###############################
+
+# Pass as arguments the *name* of the variable you want the file descriptor
+# assigned to and the filename to open. The variable with the provided name will
+# be assigned the file descriptor, e.g.
+#   open_file myfd /dev/ttyACM0
+#   echo "$myfd"
+#   echo "version" >&$myfd
+#   close_file myfd
+# Notice where the $ is used and where it's not used! Sorry this couldn't be
+# easier, but bash is just like this...
+function open_file {
+    local fdname="$1"
+    local filename="$2"
+
+    eval "exec {$fdname}<>$filename"
+
+    # gLinux systems have Intel IOMMU support enabled by default. This feature
+    # is buggy, and if we open and close the serial ports too quickly in
+    # succession, it could potentially cause a full system crash - yes, it's
+    # possible to completely crash a Linux system with Intel IOMMU enabled by
+    # just opening and closing serial ports, try it yourself! Ensuring there's
+    # at least a 1ms delay seems to be sufficient to stave off this problem.
+    # Using 5ms to give a little margin, since it seems like slower machines are
+    # more likely to run into this problem.
+    sleep 0.005
+}
+
+# Close file descriptor assigned to variable with provided *name*. We want a
+# name, not a variable - see the example in the comment for open_file!
+function close_file {
+    local fdname="$1"
+
+    eval "exec {$fdname}>&-"
+
+    # See comment in open_file for why this is necessary.
+    sleep 0.005
+}
+
+function get_port {
+  if [ ! -z "$TARGET_PORT" ]; then
+    if [ -c "$TARGET_PORT" ]; then
+      debug_msg "Found: \"${TARGET_PORT}\""
+      clean_port "$TARGET_PORT"
+
+      if [ "$TARGET_BAUD_RATE" -eq 0 ]; then
+        debug_msg "Baudrate: 0 - Check automatically"
+        baudrate "$TARGET_PORT"
+      fi
+    else
+      echo "ERROR: Can't find \"${TARGET_PORT}\"" > "$(pwd)/fct_last_cmd_$(basename ${TARGET_PORT}).log"
+      exit 1
+    fi
+  elif [ ! -z "$TARGET_SERIAL" ]; then
+    find_device_from_port
+  else
+    echo "ERROR: Need Port(-p) or Serial#(-s)"
+    echo ""
+    usage
+    exit 1
+  fi
+}
+
+function set_port_attr {
+  local port="${1:-}"
+  local baudrate="${2:-$TARGET_BAUD_RATE}"
+
+  debug_msg "Baud Rate:${baudrate}"
+
+  # Don't "" on $PORT_ATTR because it isn't single parameter.
+  stty -F "$port" "$baudrate" $PORT_ATTR
+
+  setserial "$port" low_latency
+}
+
+function create_port_list {
+  TARGET_PORT_LIST="$(ls ${PORT_PATH_USB}* 2> /dev/null)"
+
+  debug_msg "Port List: \"${TARGET_PORT_LIST}\""
+}
+
+function scan_port {
+  local option="${1:-}"
+  local serial port
+  local long_output=0
+  local scan_baudrate=0
+
+  if [ "$option" = "-l" ]; then
+    long_output=1
+  elif [ ! -z "$option" ]; then
+    echo "ERROR: Unsupported option \"$option\""
+    echo ""
+    usage
+    exit 1
+  fi
+
+  if [ "$TARGET_BAUD_RATE" -eq 0 ]; then
+    debug_msg "Baudrate: 0 - Check automatically"
+    scan_baudrate=1
+  fi
+
+  echo "List of devices attached"
+  echo ""
+
+  create_port_list
+
+  for port in $TARGET_PORT_LIST; do
+    TARGET_PORT="$port"
+    clean_port "$port"
+
+    if [ "$scan_baudrate" -eq 1 ]; then
+      debug_msg "Scanning baudrate: ${port}"
+      baudrate "$port"
+    fi
+    serial="$(get_serial ${port})"
+
+    if [ "$serial" = "$CMD_ERROR_NO_RESPONSE" ] ||
+       [ "$serial" = "$CMD_ERROR_GEN" ]; then
+      debug_msg "Skip Counting: ${port}:${serial}"
+    else
+      echo "${port}:${serial}"
+      echo ""
+
+      FCT_PORT_LIST+=("$port")
+      FCT_PORT_SERIAL_LIST+=("$serial")
+
+      if [ "$long_output" -eq 1 ]; then
+        exec_shell_cmd "version" "$port" "$TIMEOUT_GET_SERIAL"
+      fi
+    fi
+  done
+}
+
+function get_port_baudrate {
+  local port="${1:-}"
+  local baudrate version
+
+  debug_msg "Finding port baudrate"
+  # default baudrate
+  TARGET_BAUD_RATE="$BAUDRATE_DEFAULT"
+
+  for baudrate in $BAUDRATE_SUPPORTED; do
+    set_port_attr "$port" "$baudrate"
+
+    # Open file for $port
+    open_file fd "$port"
+
+    send_cmd "$fd" "version"
+
+    version="$(get_resp "$fd" ${TIMEOUT_GET_SERIAL} 1)"
+    if [[ "$version" =~ "$CMD_ERROR_TIMEOUT" ]]; then
+      debug_msg "Can't communicate device on ${baudrate}"
+    else
+      echo "${port} baudrate: ${baudrate}"
+      TARGET_BAUD_RATE="$baudrate"
+      break
+    fi
+
+    # Close file for $port
+    close_file fd
+  done
+}
+
+function set_port_baudrate {
+  local port="${1:-}"
+  local baudrate="${2:-}"
+
+  if [ "${baudrate}" -ne 1000000 ] &&
+     [ "${baudrate}" -ne 2000000 ] &&
+     [ "${baudrate}" -ne 3000000 ] &&
+     [ "${baudrate}" -ne 115200 ]; then
+    echo "ERROR: Unsupported Baud Rate - ${baudrate}"
+    echo "ERROR: Supported Baud Rate - 115200|1000000|2000000|3000000"
+  else
+    get_port_baudrate "$port"
+
+    debug_msg "Setting baudrate: ${port}, ${baudrate}"
+
+    if [ "$baudrate" -ne "$TARGET_BAUD_RATE" ]; then
+      echo "New Baudrate: ${baudrate}"
+      send_cmd_baudrate "$port" "$baudrate"
+
+      get_port_baudrate "$port"
+    else
+      echo "Current Baudrate: ${baudrate}"
+    fi
+  fi
+}
+
+function baudrate {
+  local port="${1:-}"
+  local baudrate="${2:-}"
+
+  if [ -z "$baudrate" ]; then
+    get_port_baudrate "$port"
+  else
+    set_port_baudrate "$port" "$baudrate"
+  fi
+}
+
+###############################
+# Dump command output
+###############################
+function get_runin_log {
+  local port="${1:-}"
+  local baudrate="${2:-$BAUDRATE_RUNIN_LOG}"
+  local runin_log_file="$(pwd)/runin_log_$(basename ${port})_$(date +%m%d%Y_%H%M%S).log"
+
+  # Get current port baudrate and set port attribute
+  baudrate "$port"
+
+  if [ "$baudrate" -ne "$TARGET_BAUD_RATE" ]; then
+    echo "Baudrate for Runin log: ${baudrate}"
+    send_cmd_baudrate "$port" "$baudrate"
+  fi
+
+  echo "Runin Log: Download Start"
+
+  # Open file for $port
+  open_file fd "$port"
+
+  send_cmd "$fd" "runin log"
+
+  # get_resp is too slow if we use a high baud rate, use tee and grep instead.
+  # Need to launch tee in a subshell rather than pipe, so that it will terminate
+  # after grep has found what it's looking for.
+  grep -a -o -m 1 "$DEV_RESP_DONE" <(tee "$runin_log_file" <&"$fd")
+
+  # Close file for $port
+  close_file fd
+
+  echo "Runin Log: ${runin_log_file}"
+  echo "Runin Log: Download Done"
+
+  if [ "$baudrate" -ne "$TARGET_BAUD_RATE" ]; then
+    echo "Update Baudrate to original: ${TARGET_BAUD_RATE}"
+    send_cmd_baudrate "$port" "$TARGET_BAUD_RATE"
+  fi
+}
+
+function get_fct_radar_frame_raw {
+  local port="${1:-}"
+  local fct_radar_frame_file="$(pwd)/fct_radar_frame_raw_$(basename ${port})_$(date +%m%d%Y_%H%M%S).bin"
+
+  echo "fct-radar frame: Set outmode raw"
+
+  # Open file for $port
+  open_file fd "$port"
+
+  # Shouldn't use exec_shell_cmd in dumping routine
+  # Otherwise baudrate setting will be messed up
+  send_cmd "$fd" "fct-radar outmode raw"
+  get_resp "$fd" 1 1 > /dev/null
+
+  echo "fct-radar frame: Download Start"
+
+  send_cmd "$fd" "fct-radar frame"
+  get_resp "$fd" 1 1 1 "ACK: fct-radar"
+  python -u "${DIR}/util/get_frame_header.py" <&"$fd" > "$fct_radar_frame_file"
+
+  # Close file for $port
+  close_file fd
+
+  echo "fct-radar frame: ${fct_radar_frame_file}"
+  echo "fct-radar frame: Download Done"
+}
+
+###############################
+# Find Device
+###############################
+function get_serial {
+  local port="${1:-}"
+  local serial="$(exec_shell_cmd "${CMD_GET_SERIAL}" "$port" "$TIMEOUT_GET_SERIAL")"
+
+  if [[ "$serial" =~ "$DEV_RESP_NOT_FOUND" ]]; then
+    serial="$CMD_ERROR_GEN"
+  elif [[ "$serial" =~ "$DEV_RESP_SYSENV_GET_ERROR" ]]; then
+    serial="$CMD_ERROR_NO_SERIAL"
+  elif [[ "$serial" =~ "$CMD_ERROR_TIMEOUT" ]]; then
+    serial="$CMD_ERROR_NO_RESPONSE"
+  else
+    serial="$(echo "${serial}" | awk '/ACK: sysenv/{getline; print}' | tr -d '\r' )"
+  fi
+
+  echo "$serial"
+}
+
+function find_device_from_port {
+  local port serial
+
+  debug_msg "Finding: ${TARGET_SERIAL} from Port"
+
+  create_port_list
+  for port in $TARGET_PORT_LIST; do
+    TARGET_PORT="$port"
+    clean_port "$port"
+    serial="$(get_serial ${port})"
+    debug_msg "${port}:${serial}"
+
+    if [ "$serial" = "$TARGET_SERIAL" ]; then
+
+      debug_msg "Found: ${TARGET_PORT}:${TARGET_SERIAL}"
+      break
+    fi
+    TARGET_PORT=""
+  done
+
+  if [ -z "$TARGET_PORT" ]; then
+    echo "ERROR: Can't find \"${TARGET_SERIAL}\"" > "$(pwd)/fct_last_cmd.log"
+    exit 1
+  fi
+}
+
+###############################
+# Temperature Logging
+###############################
+function save_pid {
+  $@ &
+  local pid="$!"
+
+  FCT_PORT_PID_LIST+=("$pid")
+}
+
+function temp_logging {
+  local port="${1:-}"
+  local interval="${2:-}"
+
+  local ntc_mcu ntc_wifi temp rh
+
+  TARGET_PORT="$port"
+
+  echo -ne "Timestamp\t"
+  echo -ne "NTC_MCU\t"
+  echo -ne "NTC_WIFI\t"
+  echo -ne "Temperature\t"
+  echo -ne "Relative Humidity\n"
+
+  while true; do
+    ntc_mcu="$(exec_shell_cmd "$CMD_NTC_MCU" ${port} | grep "ntc_mcu temp" | cut -d "=" -f 2 | tr -d '\r')"
+    ntc_wifi="$(exec_shell_cmd "$CMD_NTC_WIFI" ${port} | grep "ntc_wifi temp" | cut -d "=" -f 2 | tr -d '\r')"
+    temp="$(exec_shell_cmd "$CMD_READ_TEMP" ${port} | grep "Temperature" | cut -d " " -f 2)"
+    rh="$(exec_shell_cmd "$CMD_READ_RH" ${port} | grep "Relative Humidity" | cut -d " " -f 3 | tr -d '%''\r')"
+
+    echo -ne "$(date "+%D %T")\t"
+    echo -ne "$((ntc_mcu/100)).$(printf "%0.2d" $((ntc_mcu%100)))\t"
+    echo -ne "$((ntc_wifi/100)).$(printf "%0.2d" $((ntc_wifi%100)))\t"
+    echo -ne "${temp}\t"
+    echo -ne "${rh}\n"
+
+    sleep "$interval"
+  done
+}
+
+function exec_temp_logging {
+  local interval="${1:-$TEMP_LOG_INTERVAL}"
+  local duration="${2:-$TEMP_LOG_DURATION}"
+  local port
+
+  scan_port
+
+  echo ""
+  echo "Start Temp logging: Sample Rate-${interval}sec, Duration-${duration}sec"
+  echo ""
+
+  for port in ${FCT_PORT_LIST[*]}; do
+    echo "Log for ${port} : $(pwd)/temp_logging_$(basename ${port}).csv"
+    save_pid temp_logging "$port" "$interval" > "$(pwd)/temp_logging_$(basename ${port}).csv"
+  done
+
+  debug_msg "PID List: ${FCT_PORT_PID_LIST[*]}"
+
+  sleep "$duration"
+
+  echo ""
+  echo "Time Expired"
+  exit_fct
+}
+
+###############################
+# General
+###############################
+function clean_port {
+  local port="${1:-}"
+  local running_pids="$(ps aux | grep ${port} | grep -v grep | grep -v ${0} | awk '{print $2}')"
+
+  if [ ! -z "$running_pids" ] && [ "$SKIP_CLEAN_PORT" -eq 0 ]; then
+    debug_msg "${port} is being used"
+
+    for pid in $running_pids; do
+      debug_msg "Killing ${pid}"
+      kill -9 "$pid"
+    done
+  fi
+}
+
+function version {
+  echo "$(basename ${0}) v${VERSION}"
+}
+
+function usage {
+  version
+  echo "Usage:"
+  echo "  $(basename ${0}) [Option] <Command>"
+  echo "    Options"
+  echo "      -p <device port>   : port for serial communication (port has priority than serial number)"
+  echo "      -s <serial number> : scan device serial number to find port"
+  echo "      -t <timeout>       : set shell command timeout(sec)"
+  echo "      -B <baud rate>     : set port baud rate. Default: ${TARGET_BAUD_RATE}, 0: auto"
+  echo "      -e <exit string>   : stop recording response when device return exit string"
+  echo "      -r <exit regex>    : stop recording response when device return matches with regex"
+  echo "      -k                 : skip cleaning port"
+  echo "      -c                 : send command only without waiting device response"
+  echo "      -d                 : debugging mode"
+  echo ""
+  echo "    Commands"
+  echo "      shell <Shell CMD>  : send <Shell CMD> to device"
+  echo "      get_resp           : get device response only"
+  echo "      devices [-l]       : list connected devices (-l for long output)"
+  echo "      temp_logging <sample rate> <duration>"
+  echo "                         : temperature logging for multi devices"
+  echo "      baudrate [baudrate]: get port baudrate or set baudrate"
+  echo "      runin_log [baudrate]"
+  echo "      fct_radar_frame [baudrate]"
+  echo "                         : download runin log to host pc"
+  echo "      help               : show this help message"
+  echo "      version            : show script version"
+  echo ""
+  echo "    Examples"
+  echo "      $(basename ${0}) devices [-l]"
+  echo "      $(basename ${0}) -p /dev/ttyACM0 shell version"
+  echo "      $(basename ${0}) -s 1234567890ABCDEF shell version"
+  echo "      $(basename ${0}) -p /dev/ttyACM0 runin_log"
+  echo "      $(basename ${0}) -p /dev/ttyACM0 fct_radar_frame"
+}
+
+function debug_msg {
+  if [ "$DEBUG_MODE" = "-d" ]; then
+    echo "# $1"
+  fi
+}
+
+function run_script_gen_cmd {
+  case "$1" in
+    devices)
+      scan_port "$2"
+      show_time_duration
+      exit 0
+      ;;
+    version)
+      version
+      exit 0
+      ;;
+    help)
+      usage
+      exit 0
+      ;;
+  esac
+}
+
+function show_time_duration {
+  if [ "$SHOW_TIME_DUR" -eq 1 ]; then
+    echo "Time Duration: $(($(date +%s%3N) - time_start)) ms"
+  fi
+}
+
+#########################
+# Signal Functions
+#########################
+function exit_fct {
+  if [ -n "$FCT_PORT_PID_LIST" ]; then
+    for pid in ${FCT_PORT_PID_LIST[*]}; do
+      debug_msg "Stop process ${pid}"
+      kill -9 "$pid"
+    done
+  fi
+
+  exit 0
+}
+
+trap exit_fct SIGTERM SIGINT
+
+############################
+# Script Main
+############################
+function z1_fct_main {
+  while getopts p:s:dt:B:e:kcr: opt; do
+    case $opt in
+    p)
+      TARGET_PORT=$OPTARG
+      ;;
+    s)
+      TARGET_SERIAL=$OPTARG
+      ;;
+    d)
+      DEBUG_MODE="-d"
+      SHOW_TIME_DUR=1
+      ;;
+    t)
+      TIMEOUT=$OPTARG
+      ;;
+    B)
+      TARGET_BAUD_RATE=$OPTARG
+      if [ "$TARGET_BAUD_RATE" -ne 1000000 ] &&
+         [ "$TARGET_BAUD_RATE" -ne 2000000 ] &&
+         [ "$TARGET_BAUD_RATE" -ne 3000000 ] &&
+         [ "$TARGET_BAUD_RATE" -ne 115200 ] &&
+         [ "$TARGET_BAUD_RATE" -ne 0 ]; then
+        echo "ERROR: Unsupported Baud Rate - ${TARGET_BAUD_RATE}"
+        echo "ERROR: Supported Baud Rate - 115200|1000000|2000000|3000000|0(AUTO)"
+        exit 1
+      fi
+      ;;
+    e)
+      EXIT_STRING="$OPTARG"
+      debug_msg "EXIT_STRING: \"${EXIT_STRING}\""
+      ;;
+    r)
+      EXIT_REGEX="$OPTARG"
+      debug_msg "EXIT_REGEX: \"${EXIT_REGEX}\""
+      ;;
+    k)
+      SKIP_CLEAN_PORT=1
+      ;;
+    c)
+      SEND_CMD_ONLY=1
+      ;;
+    *)
+      echo "Invalid arguments"
+      echo ""
+      usage
+      exit 1
+    esac
+  done
+  shift $((OPTIND-1))
+
+  if [ "$SHOW_TIME_DUR" -eq 1 ]; then
+    time_start="$(date +%s%3N)"
+  fi
+
+  if [ "$1" = "temp_logging" ]; then
+    shift 1
+
+    exec_temp_logging $@
+  else
+    run_script_gen_cmd $@
+
+    get_port
+
+    if [ "$1" = "shell" ]; then
+      shift 1
+      FCT_CMD="$@"
+      exec_shell_cmd "$FCT_CMD"
+    elif [ "$1" = "get_resp" ]; then
+      open_file fd "$TARGET_PORT"
+      get_resp "$fd" "$TIMEOUT" 1 1
+      close_file fd
+    elif [ "$1" = "runin_log" ]; then
+      get_runin_log "$TARGET_PORT" "$2"
+    elif [ "$1" = "fct_radar_frame" ]; then
+      get_fct_radar_frame_raw "$TARGET_PORT" "$2"
+    elif [ "$1" = "baudrate" ]; then
+      baudrate "$TARGET_PORT" "$2"
+    else
+      echo "ERROR: Unsupported Command - ${@}"
+      echo ""
+      usage
+      exit 1
+    fi
+  fi
+
+  show_time_duration
+}
+
+z1_fct_main "$@"

@@ -1,0 +1,23 @@
+product: C6T6                 # 产品名称
+station_name: Display              # 站点名称
+MES: false           # 数据上传标志，true上传
+level_config: P1   # # 生產階段(如：p1, pvt)
+station_id: CG2LSENSE01      # 测试站id
+line_ID: LS1              # 线体id
+station_number: '0001'       # 测试站编号
+test_count: 1                # 测试up数量
+auto_start: false    # 自动启动测试流程
+scan: false                  # 扫描模式
+async_mode: false            # 異步啓動模式, 模式為true時，將會異步啓動測試
+summary_file_type: LSSummaryFile         # summary file数据格式类型(grr)
+summary_type: LSSummaryData              # summary数据格式类型(测试日志等)
+test_flow_form: TestItemsNewForm         # 视图显示配置
+test_flow_type: Interface.MuSampl2Flow.MutSample2Flow           # 执行测试流程类型名称
+test_mode: 1                             # 测试模式
+log_folder: logs                      # 日志路径
+summary_location: SummaryData         # summay路径
+spec_name: spec.csv                      # 使用spec文件
+sw_version: V1.0.0.0                     #软件版本--无效
+grr_mode: false
+FTP: true            # true 上传到共享盘,否则不上传
+FTP_PATH:     # ftp 地址

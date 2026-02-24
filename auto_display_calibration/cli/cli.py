@@ -29,8 +29,8 @@ class UartPort:
 
 # Windows: port="COM0"
 _uart = UartPort(port="COM0", baudrate=115200)
-# Linux: port="/dev/ttyUSB0"
-#_uart = UartPort(port="/dev/ttyUSB0", baudrate=115200)
+# Linux: port="/dev/ttyACM0"
+#_uart = UartPort(port="/dev/ttyACM0", baudrate=115200)
 
 def detect_com_ports():
     """

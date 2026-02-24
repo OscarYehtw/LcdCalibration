@@ -194,7 +194,12 @@ if __name__ == "__main__":
     cal = DisplayCalibrator(max_delta_uv=0.004)
     result = cal.compute_matrix(measurements, master_p, master_w)
 
-    if 1:
+    matrix_flattened = result['Mf'].flatten()
+    matrix_string = ",".join([f"{x:.5f}" for x in matrix_flattened])
+    print(f"disp_cal_mf {matrix_string}")
+    print(f"disp_cal_rgb_max {result['RGB_max']}")
+
+    if 0:
      print("Calibration Matrix (Mf):\n", result['Mf'])
      print("Targe Matrix (Ms):\n", result['Ms'])
      print("Device Matrix (Md):\n", result['Md'])
